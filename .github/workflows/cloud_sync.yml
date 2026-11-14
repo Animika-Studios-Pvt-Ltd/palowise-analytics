@@ -1,0 +1,63 @@
+name: Lumos OneDrive to Supabase Sync
+
+on:
+  schedule:
+    # Runs every 30 minutes, 24/7
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: 'Force sync regardless of SHA-256 state'
+        required: false
+        type: boolean
+        default: false
+
+# Prevent concurrent runs from colliding
+concurrency:
+  group: lumos-cloud-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync OneDrive to Supabase
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Cloud Synchronization
+        env:
+          # Supabase Cloud Database Credentials
+          SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
+          SUPABASE_DATABASE: ${{ secrets.SUPABASE_DATABASE }}
+          SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PASSWORD: ${{ secrets.SUPABASE_PASSWORD }}
+          SUPABASE_SSLMODE: 'require'
+
+          # Microsoft Graph API Credentials (for OneDrive Access)
+          MS_GRAPH_TENANT_ID: ${{ secrets.MS_GRAPH_TENANT_ID }}
+          MS_GRAPH_CLIENT_ID: ${{ secrets.MS_GRAPH_CLIENT_ID }}
+          MS_GRAPH_CLIENT_SECRET: ${{ secrets.MS_GRAPH_CLIENT_SECRET }}
+          ONEDRIVE_USER_PRINCIPAL_NAME: ${{ secrets.ONEDRIVE_USER_PRINCIPAL_NAME }}
+          ONEDRIVE_FILE_PATH: ${{ secrets.ONEDRIVE_FILE_PATH || 'lumos10.xlsx' }}
+        run: |
+          EXTRA_ARGS=""
+          if [ "${{ inputs.force_sync }}" = "true" ]; then
+            EXTRA_ARGS="--force"
+          fi
+          python cloud_sync_excel_to_supabase.py $EXTRA_ARGS
+

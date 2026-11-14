@@ -1,0 +1,32 @@
+name: Test OneDrive Excel Download
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-onedrive-download:
+    name: Test Download & Read Excel
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Test OneDrive Download & Read Worksheet
+        env:
+          ONEDRIVE_SHARE_URL: ${{ secrets.ONEDRIVE_SHARE_URL }}
+        run: |
+          python test_onedrive_download.py
+
