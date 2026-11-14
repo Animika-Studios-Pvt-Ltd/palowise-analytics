@@ -1,6 +1,9 @@
 name: Palowise Cloud Sync (OneDrive to Supabase)
 
 on:
+  schedule:
+    # Runs hourly at minute 0 UTC (24/7)
+    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -54,12 +57,18 @@ jobs:
           SUPABASE_SSLMODE: 'require'
         run: |
           ARGS=""
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            ARGS="$ARGS --dry-run"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Scheduled executions run live with SHA-256 change detection (skips if unchanged)
+            ARGS="--live"
           else
-            ARGS="$ARGS --live"
-          fi
-          if [ "${{ inputs.force_sync }}" = "true" ]; then
-            ARGS="$ARGS --force"
+            # Manual workflow_dispatch honors user-specified inputs
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              ARGS="--dry-run"
+            else
+              ARGS="--live"
+            fi
+            if [ "${{ inputs.force_sync }}" = "true" ]; then
+              ARGS="$ARGS --force"
+            fi
           fi
           python cloud_sync_excel_to_supabase.py $ARGS

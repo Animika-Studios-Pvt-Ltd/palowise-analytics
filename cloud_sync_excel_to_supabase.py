@@ -678,29 +678,14 @@ def execute_live_sync(file_bytes: bytes, source_name: str, cfg: dict, force: boo
     print(f"Mode:                      LIVE ATOMIC MERGE (Single Transaction)")
     print("-" * 70)
 
-    # 1. Workbook Processing & Validation
-    print("[1/4] Validating Workbook & Business Rules...")
-    total_raw, eligible, excluded, errors = process_workbook(file_bytes)
-    print(f"    Total Raw Rows in Sheet:       {total_raw}")
-    print(f"    Excluded Rows:                 {len(excluded)}")
-    print(f"    Validation & Format Errors:    {len(errors)}")
-    print(f"    Eligible Leads to Merge:       {len(eligible)}")
-
-    if errors:
-        print("\n[!] CRITICAL: Validation errors encountered in source data (Sync Aborted):")
-        for err in errors[:10]:
-            print(f"    - Row #{err['row_number']}: Field '{err['field']}' -> {err['error']}")
-        return False
-
     passwords = [cfg.get("SUPABASE_PASSWORD", "")]
     conn = None
 
     try:
         conn = connect_supabase(cfg, readonly=False)
-        conn.autocommit = False
 
-        # 2. Check SHA-256 against Supabase cloud state
-        print("\n[2/4] Evaluating Cloud State...")
+        # 1. Check SHA-256 against Supabase cloud state BEFORE processing workbook
+        print("[1/4] Evaluating Cloud State...")
         last_state = get_cloud_state(conn)
 
         if last_state and not force:
@@ -710,6 +695,26 @@ def execute_live_sync(file_bytes: bytes, source_name: str, cfg: dict, force: boo
                 print("    Skipping database write. Zero compute consumed.")
                 print("=" * 70)
                 return True
+
+        # 2. Workbook Processing & Validation (only when workbook has changed or force=True)
+        print("\n[2/4] Validating Workbook & Business Rules...")
+        total_raw, eligible, excluded, errors = process_workbook(file_bytes)
+        print(f"    Total Raw Rows in Sheet:       {total_raw}")
+        print(f"    Excluded Rows:                 {len(excluded)}")
+        print(f"    Validation & Format Errors:    {len(errors)}")
+        print(f"    Eligible Leads to Merge:       {len(eligible)}")
+
+        if errors:
+            print("\n[!] CRITICAL: Validation errors encountered in source data (Sync Aborted):")
+            for err in errors[:10]:
+                print(f"    - Row #{err['row_number']}: Field '{err['field']}' -> {err['error']}")
+            return False
+
+        if not eligible:
+            print("\n[!] CRITICAL: No eligible leads found in workbook to merge. Sync Aborted.")
+            return False
+
+        conn.autocommit = False
 
         # 3. Execute Atomic Sync via Staging Table inside transaction
         print("\n[3/4] Executing Atomic Merge into Supabase...")
