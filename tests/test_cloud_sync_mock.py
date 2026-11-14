@@ -1,0 +1,188 @@
+"""
+Unit Tests for Cloud Sync Worker (OneDrive to Supabase) with Mocked DB and File
+================================================================================
+Validates cloud_sync_excel_to_supabase.py:
+  1. Business rules & workbook processing (filters, flags, dates, composite keys)
+  2. Read-only dry-run simulation calculations
+  3. Live atomic merge transaction flow and staging table execution
+  4. Automatic transaction rollback on failure
+  5. SHA-256 skip logic on unchanged files
+  6. Credential and URL redaction
+"""
+
+import io
+import unittest
+from unittest.mock import MagicMock, patch
+import pandas as pd
+
+import cloud_sync_excel_to_supabase as cs
+
+
+def make_test_excel_bytes() -> bytes:
+    buf = io.BytesIO()
+    df = pd.DataFrame({
+        "NAME": ["Test", None, "Lead 1", "Lead 2", "Lead 1"],
+        "INDUSTRY": ["Tech", "Finance", "Healthcare", "Retail", "Healthcare"],
+        "DESIGNATION": ["CTO", None, "Director", "VP", "VP (Updated)"],
+        "STARTING DATE": ["1st Jan", None, "15th May", "20th June", "15th May"],
+        "Demo Date": [None, None, "22nd May", None, "22nd May"],
+        "Pilot Conducted": ["yes", None, "Y", "false", "YES"],
+        "STATUS": ["Cold", None, "Hot", "Warm", "Hot"],
+    })
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="in", index=False)
+    return buf.getvalue()
+
+
+class TestCloudSyncMock(unittest.TestCase):
+
+    def setUp(self):
+        self.excel_bytes = make_test_excel_bytes()
+        self.mock_cfg = {
+            "SUPABASE_HOST": "aws-1-test.pooler.supabase.com",
+            "SUPABASE_PORT": "5432",
+            "SUPABASE_DATABASE": "postgres",
+            "SUPABASE_USER": "postgres.testproject",
+            "SUPABASE_PASSWORD": "SecretPassword123!",
+            "SUPABASE_SSLMODE": "require",
+            "ONEDRIVE_SHARE_URL": "https://tenant-my.sharepoint.com/:x:/g/personal/test/SecretShareToken",
+        }
+
+    # 1. Processing and Business Rules Test
+    def test_process_workbook_rules(self):
+        total_raw, eligible, excluded, errors = cs.process_workbook(self.excel_bytes)
+
+        self.assertEqual(total_raw, 5)
+        # Excluded: 1 dummy 'Test', 1 blank name, 1 duplicate Lead 1 superseded = 3 excluded
+        self.assertEqual(len(excluded), 3)
+        self.assertEqual(len(errors), 0)
+        # Eligible: Lead 1 (latest) and Lead 2 = 2 eligible
+        self.assertEqual(len(eligible), 2)
+
+        # Check Lead 1 updated designation was kept
+        eligible_dict = {rec["name"]: rec for _, rec in eligible}
+        self.assertIn("Lead 1", eligible_dict)
+        self.assertEqual(eligible_dict["Lead 1"]["designation"], "VP (Updated)")
+        self.assertEqual(eligible_dict["Lead 1"]["pilot_conducted"], "YES")
+
+    # 2. Dry-Run Simulation Logic Test
+    def test_dry_run_simulation(self):
+        mock_conn = MagicMock()
+        mock_conn.closed = False
+        mock_cur = MagicMock()
+        mock_cur.connection.encoding = "utf-8"
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+        row_lead1 = ["Lead 1", "Director", "Healthcare"] + [None] * 25
+        row_preserved = ["Preserved Lead", "Manager", "Energy"] + [None] * 25
+
+        mock_cur.fetchall.side_effect = [
+            [],  # No composite key duplicates in target table
+            [row_lead1, row_preserved],  # Existing DB rows
+        ]
+        mock_cur.fetchone.return_value = (10, 8.5)  # View count and avg days
+
+        with patch("psycopg2.connect", return_value=mock_conn):
+            success = cs.execute_dry_run(self.excel_bytes, "MockSource", self.mock_cfg)
+
+        self.assertTrue(success)
+        mock_conn.set_session.assert_called_with(readonly=True)
+        # Ensure zero write statements were executed
+        for call in mock_cur.execute.call_args_list:
+            stmt = call[0][0].strip().upper()
+            self.assertFalse(stmt.startswith("INSERT"))
+            self.assertFalse(stmt.startswith("UPDATE"))
+            self.assertFalse(stmt.startswith("DELETE"))
+            self.assertFalse(stmt.startswith("CREATE"))
+            self.assertFalse(stmt.startswith("DROP"))
+
+    # 3. Live Sync Transaction Flow Test
+    def test_live_sync_success_flow(self):
+        mock_conn = MagicMock()
+        mock_conn.closed = False
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+        with patch("psycopg2.connect", return_value=mock_conn), \
+             patch("psycopg2.extras.execute_values"), \
+             patch("cloud_sync_excel_to_supabase.get_cloud_state", return_value=None), \
+             patch("cloud_sync_excel_to_supabase.save_cloud_state"):
+
+            # fetchall for duplicates check
+            mock_cur.fetchall.return_value = []
+            # fetchone responses: pre_count, preserved_count, post_count, (view_count, avg_days)
+            mock_cur.fetchone.side_effect = [
+                (100,),  # pre_count
+                (4,),    # preserved_count
+                (101,),  # post_count
+                (20, 11.2),  # view stats
+            ]
+            mock_cur.rowcount = 1
+
+            success = cs.execute_live_sync(self.excel_bytes, "MockSource", self.mock_cfg, force=True)
+
+        self.assertTrue(success)
+        mock_conn.commit.assert_called_once()
+        mock_conn.rollback.assert_not_called()
+
+    # 4. Automatic Rollback on Failure Test
+    def test_live_sync_rollback_on_failure(self):
+        mock_conn = MagicMock()
+        mock_conn.closed = False
+        mock_cur = MagicMock()
+        mock_cur.connection.encoding = "utf-8"
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+        with patch("psycopg2.connect", return_value=mock_conn), \
+             patch("cloud_sync_excel_to_supabase.get_cloud_state", return_value=None):
+
+            mock_cur.fetchall.return_value = []
+            mock_cur.fetchone.return_value = (100,)
+            # Simulate a database failure during UPDATE
+            mock_cur.execute.side_effect = [
+                None,  # duplicates check
+                None,  # pre_count
+                None,  # create staging
+                None,  # populate staging
+                RuntimeError("Simulated DB Disk Full or Constraint Violation"),
+            ]
+
+            success = cs.execute_live_sync(self.excel_bytes, "MockSource", self.mock_cfg, force=True)
+
+        self.assertFalse(success)
+        mock_conn.rollback.assert_called_once()
+        mock_conn.commit.assert_not_called()
+
+    # 5. SHA-256 State Skip Test
+    def test_live_sync_skips_when_hash_matches(self):
+        file_hash = cs.compute_bytes_sha256(self.excel_bytes)
+        mock_conn = MagicMock()
+        mock_conn.closed = False
+
+        existing_state = {
+            "sha256": file_hash,
+            "last_synced_at": "2026-11-14 10:00:00",
+            "rows_in_db": 296,
+        }
+
+        with patch("psycopg2.connect", return_value=mock_conn), \
+             patch("cloud_sync_excel_to_supabase.get_cloud_state", return_value=existing_state):
+
+            success = cs.execute_live_sync(self.excel_bytes, "MockSource", self.mock_cfg, force=False)
+
+        self.assertTrue(success)
+        # Should not execute staging or commit since file was unchanged
+        mock_conn.commit.assert_not_called()
+
+    # 6. Redaction Test
+    def test_sanitization_in_cloud_sync(self):
+        msg = f"Failed to connect to {self.mock_cfg['SUPABASE_HOST']} with password {self.mock_cfg['SUPABASE_PASSWORD']} and url {self.mock_cfg['ONEDRIVE_SHARE_URL']}"
+        clean = cs.sanitize_message(msg, [self.mock_cfg['SUPABASE_PASSWORD']])
+
+        self.assertNotIn("SecretPassword123!", clean)
+        self.assertNotIn("SecretShareToken", clean)
+        self.assertIn("[REDACTED]", clean)
+
+
+if __name__ == "__main__":
+    unittest.main()
