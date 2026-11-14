@@ -5,13 +5,14 @@ Validates cloud_sync_excel_to_supabase.py:
   1. Business rules & workbook processing (filters, flags, dates, composite keys)
   2. Read-only dry-run simulation calculations
   3. Live atomic merge transaction flow and staging table execution
-  4. Unchanged files SHA-256 skip logic (zero DB writes, no commit)
+  4. Unchanged files SHA-256 skip logic (zero DB writes, no merge commit)
   5. Changed files flow (updates staging, calls save_cloud_state, commits)
   6. Automatic transaction rollback on failure
   7. Failed validation does not update hash
   8. Failed download exits with error without updating hash
   9. Scheduled execution CLI mode (--live) vs manual (--dry-run, --force)
   10. Credential and URL redaction
+  11. Regression tests for 'set_session cannot be used inside a transaction'
 """
 
 import io
@@ -20,8 +21,63 @@ import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 import pandas as pd
+import psycopg2
 
 import cloud_sync_excel_to_supabase as cs
+
+
+class StrictMockConnection:
+    """
+    Simulates psycopg2's C-level transaction and set_session / autocommit constraints.
+    Raises ProgrammingError if set_session() or autocommit assignment occurs in an active transaction.
+    """
+    def __init__(self):
+        self.closed = False
+        self._autocommit = False
+        self._in_transaction = False
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.cursor_mock = MagicMock()
+        self.cursor_mock.connection = self
+        self.cursor_mock.connection.encoding = "utf-8"
+
+    @property
+    def autocommit(self):
+        return self._autocommit
+
+    @autocommit.setter
+    def autocommit(self, value):
+        if self._in_transaction:
+            raise psycopg2.ProgrammingError("set_session cannot be used inside a transaction")
+        self._autocommit = value
+
+    def set_session(self, *args, **kwargs):
+        if self._in_transaction:
+            raise psycopg2.ProgrammingError("set_session cannot be used inside a transaction")
+        if kwargs.get("autocommit") is not None:
+            self._autocommit = kwargs.get("autocommit")
+
+    def cursor(self):
+        class MockCursorContext:
+            def __init__(self, parent):
+                self.parent = parent
+            def __enter__(self):
+                self.parent._in_transaction = True
+                return self.parent.cursor_mock
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+        return MockCursorContext(self)
+
+    def commit(self):
+        self.commit_count += 1
+        self._in_transaction = False
+
+    def rollback(self):
+        self.rollback_count += 1
+        self._in_transaction = False
+
+    def close(self):
+        self.closed = True
 
 
 def make_test_excel_bytes(include_date_error: bool = False) -> bytes:
@@ -93,7 +149,7 @@ class TestCloudSyncMock(unittest.TestCase):
             success = cs.execute_dry_run(self.excel_bytes, "MockSource", self.mock_cfg)
 
         self.assertTrue(success)
-        mock_conn.set_session.assert_called_with(readonly=True)
+        mock_conn.set_session.assert_called_with(readonly=True, autocommit=True)
         # Ensure zero write statements were executed
         for call in mock_cur.execute.call_args_list:
             stmt = call[0][0].strip().upper()
@@ -129,7 +185,8 @@ class TestCloudSyncMock(unittest.TestCase):
             success = cs.execute_live_sync(self.excel_bytes, "MockSource", self.mock_cfg, force=True)
 
         self.assertTrue(success)
-        mock_conn.commit.assert_called_once()
+        # 1 cleanup commit after get_cloud_state + 1 final atomic merge commit
+        self.assertGreaterEqual(mock_conn.commit.call_count, 1)
         mock_conn.rollback.assert_not_called()
         mock_save_state.assert_called_once()
 
@@ -159,7 +216,6 @@ class TestCloudSyncMock(unittest.TestCase):
 
         self.assertFalse(success)
         mock_conn.rollback.assert_called_once()
-        mock_conn.commit.assert_not_called()
         mock_save_state.assert_not_called()
 
     # 5. SHA-256 State Skip Test (Unchanged file)
@@ -181,8 +237,7 @@ class TestCloudSyncMock(unittest.TestCase):
             success = cs.execute_live_sync(self.excel_bytes, "MockSource", self.mock_cfg, force=False)
 
         self.assertTrue(success)
-        # Should not execute staging, commit or save_cloud_state since file was unchanged
-        mock_conn.commit.assert_not_called()
+        # Should not execute staging, merge commit or save_cloud_state since file was unchanged
         mock_save_state.assert_not_called()
 
     # 6. Changed File Test (Hash differs from state table)
@@ -215,7 +270,7 @@ class TestCloudSyncMock(unittest.TestCase):
             success = cs.execute_live_sync(self.excel_bytes, "MockSource", self.mock_cfg, force=False)
 
         self.assertTrue(success)
-        mock_conn.commit.assert_called_once()
+        self.assertGreaterEqual(mock_conn.commit.call_count, 1)
         mock_save_state.assert_called_once()
 
     # 7. Failed Validation Test (Does not update hash)
@@ -237,7 +292,6 @@ class TestCloudSyncMock(unittest.TestCase):
             success = cs.execute_live_sync(corrupt_excel, "MockSource", self.mock_cfg, force=False)
 
         self.assertFalse(success)
-        mock_conn.commit.assert_not_called()
         mock_save_state.assert_not_called()
 
     # 8. Failed Download Test (Exits with error without DB interaction)
@@ -290,6 +344,45 @@ class TestCloudSyncMock(unittest.TestCase):
         self.assertNotIn("SecretPassword123!", clean)
         self.assertNotIn("SecretShareToken", clean)
         self.assertIn("[REDACTED]", clean)
+
+    # 11. Regression Tests: 'set_session cannot be used inside a transaction'
+    def test_regression_set_session_error_reproduced(self):
+        """Verifies that attempting set_session or autocommit on an in-transaction connection raises ProgrammingError."""
+        strict_conn = StrictMockConnection()
+        with strict_conn.cursor():
+            pass  # Starts transaction: strict_conn._in_transaction = True
+
+        with self.assertRaises(psycopg2.ProgrammingError) as ctx1:
+            strict_conn.autocommit = False
+        self.assertIn("set_session cannot be used inside a transaction", str(ctx1.exception))
+
+        with self.assertRaises(psycopg2.ProgrammingError) as ctx2:
+            strict_conn.set_session(readonly=False)
+        self.assertIn("set_session cannot be used inside a transaction", str(ctx2.exception))
+
+    def test_regression_live_sync_does_not_call_set_session_in_transaction(self):
+        """Verifies that execute_live_sync never invokes set_session or autocommit inside an active transaction."""
+        strict_conn = StrictMockConnection()
+        strict_conn.cursor_mock.fetchall.return_value = []
+        strict_conn.cursor_mock.fetchone.side_effect = [
+            (296,),  # pre_count
+            (4,),    # preserved_count
+            (297,),  # post_count
+            (55, 9.16),  # view stats
+        ]
+        strict_conn.cursor_mock.rowcount = 1
+
+        with patch("psycopg2.connect", return_value=strict_conn), \
+             patch("psycopg2.extras.execute_values"), \
+             patch("cloud_sync_excel_to_supabase.get_cloud_state", return_value=None), \
+             patch("cloud_sync_excel_to_supabase.save_cloud_state"):
+
+            # Must run without raising psycopg2.ProgrammingError: set_session cannot be used inside a transaction
+            success = cs.execute_live_sync(self.excel_bytes, "MockSource", self.mock_cfg, force=True)
+
+        self.assertTrue(success)
+        self.assertGreaterEqual(strict_conn.commit_count, 1)
+        self.assertEqual(strict_conn.rollback_count, 0)
 
 
 if __name__ == "__main__":

@@ -503,7 +503,7 @@ def connect_supabase(cfg: dict, readonly: bool = False):
         connect_timeout=20,
     )
     if readonly:
-        conn.set_session(readonly=True)
+        conn.set_session(readonly=True, autocommit=True)
     return conn
 
 
@@ -687,6 +687,7 @@ def execute_live_sync(file_bytes: bytes, source_name: str, cfg: dict, force: boo
         # 1. Check SHA-256 against Supabase cloud state BEFORE processing workbook
         print("[1/4] Evaluating Cloud State...")
         last_state = get_cloud_state(conn)
+        conn.commit()  # Cleanly close the state-check transaction
 
         if last_state and not force:
             if last_state.get("sha256") == current_hash:
@@ -713,8 +714,6 @@ def execute_live_sync(file_bytes: bytes, source_name: str, cfg: dict, force: boo
         if not eligible:
             print("\n[!] CRITICAL: No eligible leads found in workbook to merge. Sync Aborted.")
             return False
-
-        conn.autocommit = False
 
         # 3. Execute Atomic Sync via Staging Table inside transaction
         print("\n[3/4] Executing Atomic Merge into Supabase...")
